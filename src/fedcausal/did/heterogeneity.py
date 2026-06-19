@@ -19,12 +19,19 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
-from fedcausal._constants import DEFAULT_COST_BPS
+import numpy as np
+from scipy import stats
+
+from fedcausal._constants import DEFAULT_COST_BPS, EPS
+from fedcausal._exceptions import InsufficientDataError, ValidationError
+from fedcausal._validation import validate_alpha
 
 if TYPE_CHECKING:
-    import numpy as np
-
     from fedcausal.did.model import DiDResult
+
+#: Basis points per unit (a 1.0 decimal return == 10,000 bps). Used to convert the
+#: round-trip ``cost_bps`` hurdle into the same decimal units as the spread.
+_BPS_PER_UNIT: float = 10_000.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +64,25 @@ class HeterogeneitySpread:
         return asdict(self)
 
 
+def _net_spread_pvalue(net_samples: np.ndarray) -> float:
+    """Two-sided one-sample t-test p-value of the per-announcement net spread.
+
+    Returns ``1.0`` for a degenerate (zero-variance or single-observation)
+    sample rather than dividing by zero, so a constant net spread is never
+    spuriously flagged significant.
+    """
+    n = net_samples.size
+    if n < 2:
+        return 1.0
+    mean = float(net_samples.mean())
+    sd = float(net_samples.std(ddof=1))
+    se = sd / np.sqrt(n)
+    if se <= EPS:
+        return 1.0
+    t_stat = mean / se
+    return float(2.0 * stats.t.sf(abs(t_stat), df=n - 1))
+
+
 def heterogeneity_spread(
     did: DiDResult,
     spread_samples: np.ndarray,
@@ -66,11 +92,14 @@ def heterogeneity_spread(
 ) -> HeterogeneitySpread:
     """Translate the DiD heterogeneity into a NET-OF-COST tradable spread test.
 
-    Charges a round-trip ``cost_bps`` against the per-announcement treated-minus-
-    control spread and flags it tradable ONLY if the net spread is both positive
-    and statistically distinct from zero. By construction (mechanical
-    heterogeneity, fragile after costs) this reads ``False`` on the honest-null
-    deliverable.
+    The gross spread is the per-announcement treated-minus-control move (its
+    sample mean equals the DiD interaction coefficient by construction). A
+    round-trip ``cost_bps`` is converted to decimal units and subtracted from
+    EVERY per-announcement spread observation; the result is flagged tradable
+    ONLY if the net spread is BOTH positive (in the mean) AND statistically
+    distinct from zero (two-sided t-test at ``alpha``). By construction
+    (mechanical heterogeneity, fragile after costs) this reads ``False`` on the
+    honest-null deliverable.
 
     Parameters
     ----------
@@ -92,9 +121,36 @@ def heterogeneity_spread(
     Raises
     ------
     ValidationError
-        If ``cost_bps`` is negative or ``spread_samples`` is empty.
+        If ``cost_bps`` is negative or non-finite, or ``alpha`` is out of range.
+    InsufficientDataError
+        If ``spread_samples`` is empty after dropping non-finite values.
     """
-    raise NotImplementedError
+    validate_alpha(alpha)
+    cost = float(cost_bps)
+    if not np.isfinite(cost) or cost < 0.0:
+        raise ValidationError(f"cost_bps must be a non-negative finite float, got {cost_bps}.")
+
+    samples = np.asarray(spread_samples, dtype=np.float64).ravel()
+    samples = samples[np.isfinite(samples)]
+    if samples.size == 0:
+        raise InsufficientDataError("heterogeneity_spread: spread_samples is empty.")
+
+    cost_decimal = cost / _BPS_PER_UNIT
+    gross_spread = float(samples.mean())
+    net_samples = samples - cost_decimal
+    net_spread = float(net_samples.mean())
+
+    p_value = _net_spread_pvalue(net_samples)
+    # Tradable ONLY if the net spread is positive in the mean AND distinguishable
+    # from zero — both gates must clear (the honest-null reads False).
+    is_tradable_spread = bool(net_spread > 0.0 and p_value < alpha)
+
+    return HeterogeneitySpread(
+        gross_spread=gross_spread,
+        cost_bps=cost,
+        net_spread=net_spread,
+        is_tradable_spread=is_tradable_spread,
+    )
 
 
 def describe_heterogeneity(
@@ -119,4 +175,16 @@ def describe_heterogeneity(
     str
         The honest interpretation string.
     """
-    raise NotImplementedError
+    direction = "more" if did.coef >= 0.0 else "less"
+    tradable = (
+        "and the long/short spread survives transaction costs"
+        if spread.is_tradable_spread
+        else "but the long/short spread does NOT survive transaction costs"
+    )
+    return (
+        f"Rate-sensitive names move {abs(did.coef):.4f} {direction} than controls "
+        f"around the surprise (DiD t={did.t_stat:.2f}, clustered by {did.cluster}); "
+        f"this is descriptive cross-sectional heterogeneity, {tradable} "
+        f"(gross {spread.gross_spread:.4f} -> net {spread.net_spread:.4f} after "
+        f"{spread.cost_bps:.0f} bps) — not a tradable causal alpha."
+    )
