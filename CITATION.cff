@@ -1,0 +1,77 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "fed-causal: Leakage-free causal inference on FOMC announcements with an honest-NULL tradability verdict"
+abstract: >-
+  A pure, typed Python implementation of a leakage-free event-study and
+  difference-in-differences stack for Federal Open Market Committee (FOMC)
+  announcements: estimation-window-only market-model abnormal returns, cumulative
+  abnormal returns (CAR), the Boehmer-Musumeci-Poulsen standardized-residual test,
+  HAC/clustered standard errors, placebo-date randomization (the primary
+  significance source), a rate-sensitivity difference-in-differences, a
+  multiple-testing correction over the full specification grid, and a pure
+  fed_effect_is_tradable verdict. The deliverable is the rigorous, leakage-free
+  causal-inference stack, not a profit claim: after placebo randomization, HAC SEs
+  and a multiple-testing correction, the FOMC move is honest cross-sectional
+  heterogeneity (rate-sensitive names move more, mechanically), not a tradable
+  causal alpha.
+type: software
+version: 0.1.0
+date-released: "2026-06-19"
+license: MIT
+repository-code: "https://github.com/FatihHekim0glu/fed-causal"
+url: "https://fatihhekimoglu.com"
+authors:
+  - family-names: "FatihHekim0glu"
+keywords:
+  - causal-inference
+  - event-study
+  - econometrics
+  - difference-in-differences
+  - fomc
+  - monetary-policy
+  - honest-null
+references:
+  - type: article
+    title: "Using Daily Stock Returns: The Case of Event Studies"
+    authors:
+      - family-names: "Brown"
+        given-names: "Stephen J."
+      - family-names: "Warner"
+        given-names: "Jerold B."
+    journal: "Journal of Financial Economics"
+    volume: 14
+    issue: 1
+    year: 1985
+  - type: article
+    title: "Event-Study Methodology under Conditions of Event-Induced Variance"
+    authors:
+      - family-names: "Boehmer"
+        given-names: "Ekkehart"
+      - family-names: "Musumeci"
+        given-names: "Jim"
+      - family-names: "Poulsen"
+        given-names: "Annette B."
+    journal: "Journal of Financial Economics"
+    volume: 30
+    issue: 2
+    year: 1991
+  - type: article
+    title: "Event Studies in Economics and Finance"
+    authors:
+      - family-names: "MacKinlay"
+        given-names: "A. Craig"
+    journal: "Journal of Economic Literature"
+    volume: 35
+    issue: 1
+    year: 1997
+  - type: article
+    title: "Exact and Approximate Stepdown Methods for Multiple Hypothesis Testing"
+    authors:
+      - family-names: "Romano"
+        given-names: "Joseph P."
+      - family-names: "Wolf"
+        given-names: "Michael"
+    journal: "Journal of the American Statistical Association"
+    volume: 100
+    issue: 469
+    year: 2005
