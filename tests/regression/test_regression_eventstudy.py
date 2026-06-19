@@ -35,14 +35,15 @@ def _grid(panel: SyntheticPanel) -> pd.DatetimeIndex:
 
 
 @pytest.mark.regression
-def test_known_car_recovered_on_treated_within_tolerance(
+def test_known_car_recovered_market_wide_within_tolerance(
     synthetic_event_panel: SyntheticPanel,
 ) -> None:
-    """The injected CAR is recovered on the rate-sensitive names within tolerance.
+    """The injected CAR is market-wide and recovered on both groups within tolerance.
 
-    Averaged across all events, the rate-sensitive ("treated") cross-sectional CAR
-    sits at least the injected CAR (the surprise tilt adds to it on hawkish/dovish
-    events), while the control names average near zero.
+    Averaged across all events, BOTH the rate-sensitive ("treated") and the control
+    cross-sectional CAR recover the injected effect (the event-window drift is
+    market-wide, a recoverable CAR but not a tradable cross-sectional gap); the
+    treated-minus-control difference is only the small surprise tilt.
     """
     panel = synthetic_event_panel
     grid = _grid(panel)
@@ -57,11 +58,12 @@ def test_known_car_recovered_on_treated_within_tolerance(
 
     treated_mean = float(np.mean(treated_cars))
     control_mean = float(np.mean(control_cars))
-    # Treated CAR recovers (and exceeds, via the tilt) the injected effect.
+    # Both groups recover the market-wide injected CAR within tolerance.
     assert treated_mean == pytest.approx(panel.injected_car, abs=panel.injected_car * 0.8)
+    assert control_mean == pytest.approx(panel.injected_car, abs=panel.injected_car * 0.8)
     assert treated_mean > 0.0
-    # Controls have no injected effect — they average near zero.
-    assert abs(control_mean) < panel.injected_car * 0.3
+    # The treated-minus-control gap is only the small tilt, not a tradable spread.
+    assert abs(treated_mean - control_mean) < panel.injected_car * 0.5
 
 
 @pytest.mark.regression
@@ -105,25 +107,26 @@ def test_golden_event_cars_are_stable() -> None:
     grid = _grid(panel)
     windows = build_all_windows(grid, panel.announcement_dates, event_half_width=1)
     cars = stack_event_cars(panel.returns, panel.market, windows)
-    # Golden values captured from the locked seed/generator (5 dp).
+    # Golden values captured from the locked seed/generator (5 dp). The CAR is
+    # market-wide, so the per-event cross-sectional mean hugs the injected CAR.
     expected = np.array(
         [
-            0.00733,
-            0.00476,
-            0.00396,
-            0.00433,
-            0.00103,
-            0.00500,
-            0.00802,
-            0.00146,
-            0.00721,
-            0.00236,
-            -0.00148,
-            0.00712,
-            0.00419,
-            -0.00146,
-            0.00965,
-            0.00441,
+            0.01181,
+            0.01215,
+            0.00950,
+            0.00839,
+            0.00820,
+            0.01056,
+            0.01220,
+            0.00850,
+            0.01277,
+            0.00647,
+            0.00567,
+            0.01267,
+            0.00822,
+            0.00554,
+            0.01524,
+            0.00846,
         ]
     )
     assert cars.shape == expected.shape

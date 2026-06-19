@@ -110,14 +110,16 @@ def test_to_dict_is_json_summary() -> None:
 
 
 @pytest.mark.unit
-def test_known_car_is_injected_into_rate_sensitive_names() -> None:
-    """The injected CAR appears in rate-sensitive event windows, not in controls.
+def test_known_car_is_injected_market_wide_with_small_treated_tilt() -> None:
+    """The injected CAR is MARKET-WIDE; treated-minus-control is only the tilt.
 
     We recover the abnormal return as (actual - one-factor expectation) using the
     panel's own market series and an OLS market-model fit on a clean pre-event
     estimation window, then sum over each event window. Averaged across events,
-    the rate-sensitive CAR concentrates on the injected value while the control
-    CAR concentrates on zero.
+    BOTH the rate-sensitive and the control CAR concentrate on the injected value
+    (the event-window drift is market-wide, so it is a recoverable CAR but NOT a
+    tradable cross-sectional gap); the treated-minus-control difference is only
+    the small surprise-tilt heterogeneity, far below the injected CAR.
     """
     injected = 0.02
     k = 1
@@ -154,11 +156,13 @@ def test_known_car_is_injected_into_rate_sensitive_names() -> None:
 
     rs_mean = float(np.mean(rs_cars))
     ctrl_mean = float(np.mean(ctrl_cars))
-    # Rate-sensitive names recover the injected CAR within tolerance; the
-    # estimation-window-only model leaves controls near zero.
+    # The CAR is market-wide: BOTH treated and control recover the injected value
+    # within tolerance (so the event study recovers the known CAR), while the
+    # treated-minus-control gap is only the small surprise-tilt heterogeneity —
+    # far below the injected CAR, so it is not a tradable cross-sectional spread.
     assert rs_mean == pytest.approx(injected, abs=3e-3)
-    assert abs(ctrl_mean) < 3e-3
-    assert rs_mean - ctrl_mean > injected / 2
+    assert ctrl_mean == pytest.approx(injected, abs=3e-3)
+    assert abs(rs_mean - ctrl_mean) < injected / 2
 
 
 @pytest.mark.unit

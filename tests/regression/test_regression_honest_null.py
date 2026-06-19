@@ -44,9 +44,10 @@ def test_known_car_recovered_within_tolerance(
 ) -> None:
     """The injected CAR is recovered from the synthetic panel within tolerance.
 
-    The rate-sensitive ("treated") cross-sectional CAR recovers the injected
-    effect (and exceeds it via the hawkish/dovish tilt), while the control names
-    average near zero — the ground-truth recovery property.
+    The CAR is market-wide, so BOTH the rate-sensitive ("treated") and the control
+    cross-sectional CAR recover the injected effect; the treated-minus-control gap
+    is only the small hawkish/dovish tilt — the ground-truth recovery property
+    plus the honest "no tradable cross-sectional gap" property.
     """
     panel = synthetic_event_panel
     grid = _grid(panel)
@@ -62,8 +63,9 @@ def test_known_car_recovered_within_tolerance(
     treated_mean = float(np.mean(treated_cars))
     control_mean = float(np.mean(control_cars))
     assert treated_mean == pytest.approx(panel.injected_car, abs=panel.injected_car * 0.8)
+    assert control_mean == pytest.approx(panel.injected_car, abs=panel.injected_car * 0.8)
     assert treated_mean > 0.0
-    assert abs(control_mean) < panel.injected_car * 0.3
+    assert abs(treated_mean - control_mean) < panel.injected_car * 0.5
 
 
 def test_pure_noise_panel_is_not_tradable() -> None:
@@ -200,7 +202,9 @@ def test_reference_known_car_recovery_is_honest() -> None:
     control = float(recovery["recovered_control_mean_car"])
 
     assert injected > 0.0
-    # Treated names recover the injected CAR within tolerance; controls stay small.
+    # The CAR is market-wide: both treated and control recover it within tolerance;
+    # the treated-minus-control gap is only the small tilt (not a tradable spread).
     assert treated == pytest.approx(injected, abs=injected * 0.8)
+    assert control == pytest.approx(injected, abs=injected * 0.8)
     assert treated > 0.0
-    assert abs(control) < injected * 0.3
+    assert abs(treated - control) < injected * 0.5

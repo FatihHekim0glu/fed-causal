@@ -5,7 +5,7 @@
 > HAC/clustered standard errors, a multiple-testing correction, and a
 > rate-sensitivity difference-in-differences. **Torch-free** (numpy/scipy/statsmodels).
 
-[![CI](https://img.shields.io/badge/CI-pending-lightgrey)](https://github.com/FatihHekim0glu/fed-causal)
+[![CI](https://github.com/FatihHekim0glu/fed-causal/actions/workflows/ci.yml/badge.svg)](https://github.com/FatihHekim0glu/fed-causal/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## Honest headline
@@ -86,24 +86,29 @@ and held in lock-step with the live `run_analysis` output by a regression test.
 
 | Metric | Value | Reads as |
 | --- | ---: | --- |
-| Mean CAR | **+0.4766%** (`0.004766`) | A transient average move around the announcement. |
-| CAR _t_-stat | **5.53** | Large in isolation — but a raw _t_-stat is **not** the verdict. |
-| HAC _p_-value (Newey-West) | **6.4e-14** | The mean CAR survives a HAC-robust standard error. |
+| Mean CAR | **+1.028%** (`0.010282`) | A real, market-wide transient move around the announcement. |
+| CAR _t_-stat | **13.98** | Large in isolation — but a raw _t_-stat is **not** the verdict. |
+| HAC _p_-value (Newey-West) | **9.6e-70** | The mean CAR survives a HAC-robust standard error. |
 | Placebo percentile | **100.0** (placebo _p_ = 0.00) | The observed CAR sits at the top of the placebo-date null. |
-| DiD coefficient | **+0.9732%** (`0.009732`) | Rate-sensitive ("treated") names move more — real heterogeneity. |
-| DiD _p_-value / net-of-cost spread | **0.078** / **+0.0037** | The long/short spread is **not** significant net of costs. |
-| `n_tests` (spec grid) | **2** | Honest multiple-testing denominator. |
-| **`fed_effect_is_tradable`** | **`false`** | Three legs clear; the **net-of-cost tradable DiD spread fails**, so the pure verdict is `false`. |
+| DiD coefficient | **+0.225%** (`0.002251`, _p_ = 0.66) | The rate-sensitivity (hawkish-vs-dovish) heterogeneity — small and insignificant. |
+| Net-of-cost DiD spread | **−0.091%** (`−0.000911`) | The oracle long/short is **negative** after costs — not tradable. |
+| `n_tests` (spec grid) | **18** | Honest multiple-testing denominator (3 widths × 2 models × 3 surprise subsets). |
+| **`fed_effect_is_tradable`** | **`false`** | The CAR is a market-wide move, **not** a net-of-cost tradable cross-sectional spread, so the pure verdict is `false`. |
 
-The takeaway is the deliverable: even when the CAR is significant against the
-placebo null **and** HAC-robust, the move is **cross-sectional heterogeneity**
-(rate-sensitive names move more, mechanically), **not** a long/short alpha that
-survives transaction costs. The verdict is a pure function — it is **not narrated
-down to `false`**, it is *derived* `false`.
+The takeaway is the deliverable: even when the CAR is highly significant against
+the placebo null **and** HAC-robust, the move is a **market-wide event-window
+drift** plus small **cross-sectional heterogeneity** (rate-sensitive names move
+with the surprise sign) — **not** a long/short alpha that survives transaction
+costs. The net-of-cost spread is **negative**, so the verdict fails on the
+tradability leg. This holds **structurally** across seeds (the injected
+rate-sensitivity edge is calibrated below the round-trip cost), not by a knife-edge
+_p_-value. The verdict is a pure function — it is **not narrated down to `false`**,
+it is *derived* `false`.
 
-The pure-noise control panel fails every leg (placebo _p_ = 0.28, HAC _p_ = 0.16,
-DiD spread negative) and is likewise `fed_effect_is_tradable = false`, confirming
-the machinery does not manufacture an effect where none was injected.
+The pure-noise control panel fails the placebo + tradability legs (placebo _p_ =
+0.28, HAC _p_ = 0.16, net spread negative) and is likewise
+`fed_effect_is_tradable = false`, confirming the machinery does not manufacture an
+effect where none was injected.
 
 ### Correctness gates
 
@@ -121,7 +126,7 @@ not a claim. Run them with `uv run pytest`.
 | Estimation/event no-overlap | The estimation and event windows never overlap or straddle (property) | `property/test_events_windows.py::test_estimation_and_event_windows_never_overlap` |
 | Placebo excludes events | Placebo dates exclude every real event window — no contamination (property) | `property/test_eventstudy_invariants.py::test_placebo_dates_exclude_every_real_event_window` |
 | Beta invariance | Perturbing event-window returns leaves the fitted market-model betas byte-identical (property) | `property/test_eventstudy_invariants.py::test_market_model_beta_invariant_to_event_window_perturbation` |
-| Known-CAR recovery | The injected CAR is recovered within tolerance on rate-sensitive names (`0.0098` vs injected `0.01`) | `regression/test_regression_honest_null.py::test_known_car_recovered_within_tolerance` |
+| Known-CAR recovery | The injected CAR is market-wide and recovered within tolerance on BOTH groups (treated `0.0096`, control `0.0107` vs injected `0.01`); the treated-minus-control gap is only the small tilt | `regression/test_regression_honest_null.py::test_known_car_recovered_within_tolerance` |
 | Pure-noise honest-null | A pure-noise panel yields `fed_effect_is_tradable = False` after placebo + multiple testing, deterministically across `PYTHONHASHSEED` | `regression/test_regression_honest_null.py::test_pure_noise_panel_is_not_tradable` |
 
 ## Reproduce
@@ -173,12 +178,23 @@ are why the verdict is conservative by construction.
   use. Many "hawkish" meetings were fully anticipated and should carry near-zero
   surprise; classifying by realized sign mislabels them and attenuates / mislabels
   the heterogeneity contrast.
-- **PIT survivorship is approximate.** The Polygon point-in-time universe
-  approximates index membership as-of the event but cannot perfectly reconstruct
-  historical constituents (additions, deletions, ticker changes, M&A). Residual
-  survivorship bias tilts the cross-section toward names that *stayed* in the
-  index, which would, if anything, inflate an apparent effect — so the honest
-  null is the conservative reading.
+- **Real-data universe is a STATIC basket, not as-of PIT membership.** The
+  real-data path scores a fixed modern basket of rate-sensitive (financials + a
+  long-duration Treasury proxy) and rate-insensitive large-caps — it does **not**
+  resolve point-in-time index membership as-of each event date. It therefore
+  carries full survivorship bias (only names that exist *today* are scored), which
+  would, if anything, inflate an apparent effect — so the honest null is the
+  conservative reading. An as-of PIT resolver over the vendored Polygon
+  grouped-daily universe is documented future work; the deployed default runs on
+  the synthetic panel, where this does not apply.
+- **Clustered-event estimation contamination.** Each event's expected-return model
+  is fit on the [t−130, t−11] estimation window, which — when FOMC meetings are
+  closely spaced — can overlap *prior* events' event windows, so earlier abnormal
+  returns slightly bias a later event's estimated betas. The synthetic default
+  spaces events widely enough to bound this, and the no-straddle guard prevents a
+  window from crossing its *own* split, but the estimation slice is not purged of
+  *other* events' windows. A purge of prior event windows from each estimation
+  slice (standard for clustered events) is documented future work.
 - **Synthetic default is a machinery test, not market evidence.** The deployed
   default and every committed metric come from a seeded synthetic panel with a
   *known* injected CAR and rate-sensitivity heterogeneity. This validates that the

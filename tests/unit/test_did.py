@@ -549,9 +549,16 @@ def test_heterogeneity_spread_to_dict_is_json_serializable() -> None:
     """``HeterogeneitySpread.to_dict`` emits only JSON scalars."""
     did = _did_result()
     payload = heterogeneity_spread(did, np.full(20, 0.01)).to_dict()
-    assert set(payload) == {"gross_spread", "cost_bps", "net_spread", "is_tradable_spread"}
+    assert set(payload) == {
+        "gross_spread",
+        "cost_bps",
+        "net_spread",
+        "net_pvalue",
+        "is_tradable_spread",
+    }
     assert isinstance(payload["is_tradable_spread"], bool)
     assert isinstance(payload["net_spread"], float)
+    assert isinstance(payload["net_pvalue"], float)
 
 
 # --------------------------------------------------------------------------- #

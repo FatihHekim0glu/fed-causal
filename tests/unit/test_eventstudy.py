@@ -151,14 +151,15 @@ def test_abnormal_returns_shape_and_index(synthetic_event_panel: SyntheticPanel)
 
 
 @pytest.mark.unit
-def test_cumulative_abnormal_returns_recovers_injected_on_treated(
+def test_cumulative_abnormal_returns_recovers_market_wide_car(
     synthetic_event_panel: SyntheticPanel,
 ) -> None:
-    """The CAR of rate-sensitive names is materially positive; controls are ~0.
+    """Both treated and control recover the market-wide CAR; treated adds a tilt.
 
-    The injected CAR + surprise tilt lives ONLY in the rate-sensitive names, so
-    their cross-sectional CAR is large and positive while the control names sit
-    near zero (the ground-truth heterogeneity).
+    The injected CAR is MARKET-WIDE (a recoverable event-window drift, not a
+    tradable cross-sectional gap), so both groups' cross-sectional CAR is
+    materially positive; the rate-sensitive names carry only a small additional
+    surprise tilt, so the treated-minus-control gap stays well below the CAR.
     """
     panel = synthetic_event_panel
     w = build_windows(_grid(panel), panel.announcement_dates[0], event_half_width=1)
@@ -166,8 +167,15 @@ def test_cumulative_abnormal_returns_recovers_injected_on_treated(
     assert isinstance(result, CARResult)
     treated = float(result.car[panel.rate_sensitive].mean())
     control = float(result.car.drop(panel.rate_sensitive).mean())
-    assert treated > panel.injected_car * 0.5  # comfortably positive
-    assert abs(control) < panel.injected_car * 0.5  # controls near zero
+    # The discriminator vs the old treated-only design: the control group ALSO
+    # carries the market-wide CAR (under the old design it sat near zero). Both
+    # groups recover the injected effect, comfortably positive.
+    assert treated > panel.injected_car * 0.5
+    assert control > panel.injected_car * 0.5
+    # The treated-minus-control gap is only the small surprise tilt, but a SINGLE
+    # event is too noisy to bound it tightly (per-name CAR noise dominates the
+    # ~tilt-sized gap); the averaged-over-all-events gap bound lives in the
+    # regression suite (test_known_car_recovered_market_wide_within_tolerance).
 
 
 @pytest.mark.unit
