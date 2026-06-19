@@ -19,6 +19,12 @@ from dataclasses import asdict, dataclass
 from datetime import date
 from typing import TYPE_CHECKING, Any
 
+from fedcausal._exceptions import EventCalendarError
+from fedcausal.events.calendar_data import (
+    FOMC_ANNOUNCEMENTS,
+    PRE_FIRST_TARGET_UPPER,
+)
+
 if TYPE_CHECKING:
     import pandas as pd
 
@@ -76,7 +82,11 @@ def classify_surprise(rate_change_bps: float) -> SurpriseLabel:
     SurpriseLabel
         The surprise label.
     """
-    raise NotImplementedError
+    if rate_change_bps > 0.0:
+        return "hawkish"
+    if rate_change_bps < 0.0:
+        return "dovish"
+    return "neutral"
 
 
 def load_fomc_calendar(
@@ -105,7 +115,44 @@ def load_fomc_calendar(
     EventCalendarError
         If the committed calendar is empty or malformed.
     """
-    raise NotImplementedError
+    if not FOMC_ANNOUNCEMENTS:
+        raise EventCalendarError("the committed FOMC calendar is empty.")
+
+    events: list[FOMCEvent] = []
+    prev_upper = float(PRE_FIRST_TARGET_UPPER)
+    prev_date: date | None = None
+    for iso, target_upper in FOMC_ANNOUNCEMENTS:
+        try:
+            announcement_date = date.fromisoformat(iso)
+            upper = float(target_upper)
+        except (TypeError, ValueError) as exc:
+            raise EventCalendarError(
+                f"malformed FOMC calendar entry ({iso!r}, {target_upper!r})."
+            ) from exc
+        if prev_date is not None and announcement_date <= prev_date:
+            raise EventCalendarError(
+                f"FOMC calendar is not strictly increasing at {iso!r} "
+                f"(previous {prev_date.isoformat()})."
+            )
+        # Signed change vs the previous meeting, in basis points. Uses ONLY the
+        # decision embodied at this announcement (no future revision).
+        rate_change_bps = (upper - prev_upper) * 100.0
+        events.append(
+            FOMCEvent(
+                announcement_date=announcement_date,
+                target_upper=upper,
+                rate_change_bps=rate_change_bps,
+                surprise=classify_surprise(rate_change_bps),
+            )
+        )
+        prev_upper = upper
+        prev_date = announcement_date
+
+    if start is not None:
+        events = [ev for ev in events if ev.announcement_date >= start]
+    if end is not None:
+        events = [ev for ev in events if ev.announcement_date <= end]
+    return events
 
 
 def event_dates_frame(events: list[FOMCEvent]) -> pd.DataFrame:
@@ -122,4 +169,18 @@ def event_dates_frame(events: list[FOMCEvent]) -> pd.DataFrame:
         Indexed by ``announcement_date`` with ``target_upper``,
         ``rate_change_bps`` and ``surprise`` columns, sorted ascending.
     """
-    raise NotImplementedError
+    import pandas as pd
+
+    index = pd.DatetimeIndex(
+        [pd.Timestamp(ev.announcement_date) for ev in events],
+        name="announcement_date",
+    )
+    frame = pd.DataFrame(
+        {
+            "target_upper": [ev.target_upper for ev in events],
+            "rate_change_bps": [ev.rate_change_bps for ev in events],
+            "surprise": [ev.surprise for ev in events],
+        },
+        index=index,
+    )
+    return frame.sort_index()
