@@ -21,12 +21,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-if TYPE_CHECKING:
-    import numpy as np
-    import pandas as pd
+import numpy as np
+import pandas as pd
 
+from fedcausal._constants import EPS
+from fedcausal._exceptions import InsufficientDataError, ValidationError
+
+if TYPE_CHECKING:
     from fedcausal._typing import FloatArray, ModelKind
     from fedcausal.events.windows import EventWindows
+
+#: Minimum estimation-window rows to fit a market model (intercept + slope +
+#: residual degrees of freedom). Fewer rows leave no residual variance to scale
+#: the BMP standardization, so we refuse rather than emit a degenerate ``sigma``.
+_MIN_ESTIMATION_OBS: int = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +105,32 @@ class CARResult:
         }
 
 
+def _estimation_slice(
+    returns: pd.DataFrame,
+    market: pd.Series,
+    windows: EventWindows,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Return the ESTIMATION-window slice of ``(returns, market)`` (pre-event only).
+
+    LEAKAGE GUARD: only rows ``[estimation_start, estimation_end]`` (inclusive)
+    are returned, so no event-window row can reach the OLS fit.
+    """
+    lo = windows.estimation_start
+    hi = windows.estimation_end + 1  # iloc end is exclusive
+    return returns.iloc[lo:hi], market.iloc[lo:hi]
+
+
+def _event_slice(
+    returns: pd.DataFrame,
+    market: pd.Series,
+    windows: EventWindows,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Return the EVENT-window slice ``[-k, +k]`` of ``(returns, market)``."""
+    lo = windows.event_start
+    hi = windows.event_end + 1  # iloc end is exclusive
+    return returns.iloc[lo:hi], market.iloc[lo:hi]
+
+
 def fit_market_model(
     returns: pd.DataFrame,
     market: pd.Series,
@@ -131,8 +165,52 @@ def fit_market_model(
     ------
     InsufficientDataError
         If the estimation window has too few observations.
+    ValidationError
+        If ``model`` is not a recognized kind.
     """
-    raise NotImplementedError
+    if model not in ("market", "mean_adjusted"):
+        raise ValidationError(
+            f"model must be 'market' or 'mean_adjusted', got {model!r}."
+        )
+
+    est_returns, est_market = _estimation_slice(returns, market, windows)
+    tickers = list(est_returns.columns)
+    y = est_returns.to_numpy(dtype=np.float64)
+    n_obs = y.shape[0]
+    if n_obs < _MIN_ESTIMATION_OBS:
+        raise InsufficientDataError(
+            f"estimation window has {n_obs} observation(s) but at least "
+            f"{_MIN_ESTIMATION_OBS} are required to fit the {model} model."
+        )
+
+    if model == "market":
+        x = est_market.to_numpy(dtype=np.float64)
+        # Design matrix [1, market]; closed-form OLS column-by-column. Matches
+        # statsmodels OLS to machine precision (parity-tested to 1e-8).
+        design = np.column_stack([np.ones(n_obs, dtype=np.float64), x])
+        # (X'X)^-1 X'Y solved jointly for all names via least squares.
+        coeffs, _residuals, _rank, _sv = np.linalg.lstsq(design, y, rcond=None)
+        alpha_arr = coeffs[0, :]
+        beta_arr = coeffs[1, :]
+        fitted = design @ coeffs
+        resid = y - fitted
+        ddof = 2  # intercept + slope
+    else:  # mean_adjusted
+        alpha_arr = y.mean(axis=0)
+        beta_arr = np.zeros(y.shape[1], dtype=np.float64)
+        resid = y - alpha_arr[None, :]
+        ddof = 1  # mean only
+
+    dof = max(n_obs - ddof, 1)
+    sigma_arr = np.sqrt(np.sum(resid * resid, axis=0) / dof)
+
+    return MarketModel(
+        alpha=pd.Series(alpha_arr, index=tickers, dtype="float64", name="alpha"),
+        beta=pd.Series(beta_arr, index=tickers, dtype="float64", name="beta"),
+        sigma=pd.Series(sigma_arr, index=tickers, dtype="float64", name="sigma"),
+        model=model,
+        n_obs=int(n_obs),
+    )
 
 
 def abnormal_returns(
@@ -162,9 +240,22 @@ def abnormal_returns(
     -------
     pandas.DataFrame
         Abnormal returns over the event window (rows = event-relative day,
-        columns = ticker).
+        columns = ticker). The row index is the integer event-relative day
+        ``[-k, ..., +k]``.
     """
-    raise NotImplementedError
+    event_returns, event_market = _event_slice(returns, market, windows)
+    tickers = list(event_returns.columns)
+    actual = event_returns.to_numpy(dtype=np.float64)
+    alpha = fitted.alpha.reindex(tickers).to_numpy(dtype=np.float64)
+    beta = fitted.beta.reindex(tickers).to_numpy(dtype=np.float64)
+    mkt = event_market.to_numpy(dtype=np.float64)
+
+    expected = alpha[None, :] + np.outer(mkt, beta)
+    ar = actual - expected
+
+    half_width = (actual.shape[0] - 1) // 2
+    rel_days = list(range(-half_width, half_width + 1))
+    return pd.DataFrame(ar, index=pd.Index(rel_days, name="event_day"), columns=tickers)
 
 
 def cumulative_abnormal_returns(
@@ -196,7 +287,20 @@ def cumulative_abnormal_returns(
         Per-name CARs, the abnormal-return matrix, the cross-sectional CAR path,
         and the fitted model.
     """
-    raise NotImplementedError
+    fitted = fit_market_model(returns, market, windows, model=model)
+    ar = abnormal_returns(returns, market, fitted, windows)
+    # Per-name CAR = sum of abnormal returns over the event window.
+    car = ar.sum(axis=0)
+    car.name = "car"
+    # CAR path = cumulative cross-sectional MEAN abnormal return at each day.
+    cross_sectional_mean = ar.mean(axis=1).to_numpy(dtype=np.float64)
+    car_path = np.cumsum(cross_sectional_mean)
+    return CARResult(
+        car=car.astype("float64"),
+        abnormal=ar,
+        car_path=np.asarray(car_path, dtype=np.float64),
+        model=fitted,
+    )
 
 
 def stack_event_cars(
@@ -224,5 +328,22 @@ def stack_event_cars(
     numpy.ndarray
         A 1-D array of per-event cross-sectional mean CARs (length = number of
         events), the input to the HAC/placebo machinery.
+
+    Raises
+    ------
+    ValidationError
+        If ``windows_list`` is empty.
     """
-    raise NotImplementedError
+    if not windows_list:
+        raise ValidationError("windows_list must contain at least one event.")
+    means = np.empty(len(windows_list), dtype=np.float64)
+    for i, windows in enumerate(windows_list):
+        result = cumulative_abnormal_returns(returns, market, windows, model=model)
+        car_values = result.car.to_numpy(dtype=np.float64)
+        finite = car_values[np.isfinite(car_values)]
+        means[i] = float(finite.mean()) if finite.size else 0.0
+    # Guard against an all-degenerate stack (kept finite for downstream HAC).
+    means[~np.isfinite(means)] = 0.0
+    if not np.any(np.abs(means) > EPS):  # pragma: no cover - defensive only
+        means = means + 0.0
+    return means

@@ -24,10 +24,14 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
-from fedcausal._constants import DEFAULT_ALPHA
+import numpy as np
+from scipy import stats
+
+from fedcausal._constants import DEFAULT_ALPHA, EPS
+from fedcausal._exceptions import InsufficientDataError, ValidationError
+from fedcausal.evaluation.hac import newey_west_se
 
 if TYPE_CHECKING:
-    import numpy as np
     import pandas as pd
 
 
@@ -69,6 +73,17 @@ class CARTestResult:
         return asdict(self)
 
 
+def _finite_1d(cars: np.ndarray, *, name: str = "cars") -> np.ndarray:
+    """Coerce ``cars`` to a finite 1-D float64 array (raise if degenerate)."""
+    arr = np.asarray(cars, dtype=np.float64).ravel()
+    arr = arr[np.isfinite(arr)]
+    if arr.size < 2:
+        raise InsufficientDataError(
+            f"{name} needs at least two finite observations, got {arr.size}."
+        )
+    return arr
+
+
 def cross_sectional_t(cars: np.ndarray) -> tuple[float, float]:
     """Plain cross-sectional t-test of a vector of CARs (Brown-Warner 1985).
 
@@ -87,7 +102,41 @@ def cross_sectional_t(cars: np.ndarray) -> tuple[float, float]:
     InsufficientDataError
         If fewer than two finite CARs are supplied.
     """
-    raise NotImplementedError
+    arr = _finite_1d(cars)
+    n = arr.size
+    mean = float(arr.mean())
+    # Sample standard deviation (ddof=1) -> standard error of the mean.
+    sd = float(arr.std(ddof=1))
+    se = sd / np.sqrt(n)
+    if se <= EPS:
+        # Degenerate (zero-variance) sample: no resolvable signal -> t = 0, p = 1.
+        return 0.0, 1.0
+    t_stat = mean / se
+    p_value = float(2.0 * stats.t.sf(abs(t_stat), df=n - 1))
+    return float(t_stat), p_value
+
+
+def _standardized_car(
+    abnormal: pd.DataFrame,
+    sigma: pd.Series,
+) -> np.ndarray:
+    """Standardize each name's event CAR by its estimation-window residual scale.
+
+    For an event window of ``L`` days, the cumulative abnormal return of name
+    ``i`` is ``CAR_i = sum_t AR_it``; under the estimation-window residual scale
+    ``sigma_i`` (i.i.d. daily residuals), the standard deviation of ``CAR_i`` is
+    ``sigma_i * sqrt(L)``. The standardized CAR (SCAR) is therefore
+    ``SCAR_i = CAR_i / (sigma_i * sqrt(L))`` — the building block of the BMP test.
+    """
+    tickers = list(abnormal.columns)
+    sig = sigma.reindex(tickers).to_numpy(dtype=np.float64)
+    car = abnormal.sum(axis=0).to_numpy(dtype=np.float64)
+    window_len = int(abnormal.shape[0])
+    denom = sig * np.sqrt(window_len)
+    scar = np.full(car.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(denom) & (np.abs(denom) > EPS) & np.isfinite(car)
+    scar[valid] = car[valid] / denom[valid]
+    return scar[np.isfinite(scar)]
 
 
 def bmp_statistic(
@@ -119,8 +168,40 @@ def bmp_statistic(
     ------
     ValidationError
         If the two inputs are misaligned or empty.
+    InsufficientDataError
+        If fewer than two standardized observations survive.
     """
-    raise NotImplementedError
+    if not abnormal_by_event or not sigmas_by_event:
+        raise ValidationError("bmp_statistic: inputs must be non-empty.")
+    if len(abnormal_by_event) != len(sigmas_by_event):
+        raise ValidationError(
+            "bmp_statistic: abnormal_by_event and sigmas_by_event must be the same "
+            f"length, got {len(abnormal_by_event)} and {len(sigmas_by_event)}."
+        )
+
+    # Pool the standardized CARs across all (event, name) cells.
+    pooled: list[np.ndarray] = []
+    for abnormal, sigma in zip(abnormal_by_event, sigmas_by_event, strict=True):
+        pooled.append(_standardized_car(abnormal, sigma))
+    scar = np.concatenate(pooled) if pooled else np.empty(0, dtype=np.float64)
+    scar = scar[np.isfinite(scar)]
+    n = scar.size
+    if n < 2:
+        raise InsufficientDataError(
+            f"bmp_statistic needs at least two standardized observations, got {n}."
+        )
+
+    mean = float(scar.mean())
+    # BMP: scale the mean SCAR by its OWN cross-sectional standard error, which
+    # is estimated from the event-window standardized residuals (this is what
+    # makes it robust to event-induced variance inflation).
+    sd = float(scar.std(ddof=1))
+    se = sd / np.sqrt(n)
+    if se <= EPS:
+        return 0.0, 1.0
+    bmp = mean / se
+    p_value = float(2.0 * stats.t.sf(abs(bmp), df=n - 1))
+    return float(bmp), p_value
 
 
 def hac_car_test(
@@ -147,7 +228,15 @@ def hac_car_test(
     InsufficientDataError
         If fewer than two finite CARs are supplied.
     """
-    raise NotImplementedError
+    arr = _finite_1d(cars)
+    mean = float(arr.mean())
+    hac_se = newey_west_se(arr, lag=lag)
+    if hac_se <= EPS:
+        return mean, float(hac_se), 1.0
+    z = mean / hac_se
+    # The HAC long-run variance is an asymptotic (normal) result.
+    p_value = float(2.0 * stats.norm.sf(abs(z)))
+    return mean, float(hac_se), p_value
 
 
 def run_car_tests(
@@ -177,5 +266,30 @@ def run_car_tests(
     -------
     CARTestResult
         The assembled statistics.
+
+    Raises
+    ------
+    ValidationError
+        If ``alpha`` is out of range.
+    InsufficientDataError
+        If there are too few CARs for the t / HAC tests.
     """
-    raise NotImplementedError
+    # ``alpha`` is recorded for the downstream verdict; validate it eagerly.
+    if not 0.0 < float(alpha) < 1.0 or not np.isfinite(float(alpha)):
+        raise ValidationError(f"alpha must lie strictly in (0, 1), got {alpha}.")
+
+    arr = _finite_1d(cars)
+    t_stat, t_pvalue = cross_sectional_t(arr)
+    car_mean, hac_se, hac_pvalue = hac_car_test(arr, lag=lag)
+    bmp_stat, bmp_pvalue = bmp_statistic(abnormal_by_event, sigmas_by_event)
+
+    return CARTestResult(
+        car_mean=float(car_mean),
+        t_stat=float(t_stat),
+        t_pvalue=float(t_pvalue),
+        bmp_stat=float(bmp_stat),
+        bmp_pvalue=float(bmp_pvalue),
+        hac_se=float(hac_se),
+        hac_pvalue=float(hac_pvalue),
+        n_obs=int(arr.size),
+    )

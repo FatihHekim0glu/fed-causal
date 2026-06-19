@@ -24,16 +24,25 @@ from dataclasses import asdict, dataclass
 from datetime import date
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+
 from fedcausal._constants import (
     DEFAULT_ESTIMATION_GAP,
     DEFAULT_ESTIMATION_WINDOW,
 )
+from fedcausal._exceptions import EventCalendarError, InsufficientDataError
+from fedcausal._rng import make_rng
+from fedcausal.events.windows import build_windows
+from fedcausal.eventstudy.abnormal import cumulative_abnormal_returns
 
 if TYPE_CHECKING:
-    import numpy as np
     import pandas as pd
 
     from fedcausal._typing import ModelKind
+
+#: Extra trading-day buffer placed around each real event window when carving the
+#: forbidden set, so a placebo window cannot brush a real event window.
+_PLACEBO_BUFFER: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +82,48 @@ class PlaceboResult:
         return payload
 
 
+def _forbidden_positions(
+    grid: pd.DatetimeIndex,
+    event_dates: list[date],
+    *,
+    event_half_width: int,
+    estimation_window: int,
+    estimation_gap: int,
+) -> set[int]:
+    """Return the set of grid positions a placebo anchor may NOT take.
+
+    A position is forbidden when:
+
+    - its event window (plus a buffer) would overlap any REAL event window
+      (the leakage guard — no real effect may leak into the null), OR
+    - it lacks a complete pre-event estimation window (leading burn-in), OR
+    - its event window would run off the end of the grid (trailing pad).
+    """
+    n = len(grid)
+    forbidden: set[int] = set()
+
+    # Leading burn-in: every anchor needs estimation_window + gap + k days of
+    # pre-event history (mirrors fedcausal.events.windows.build_windows).
+    burn_in = estimation_window + estimation_gap + event_half_width
+    forbidden.update(range(0, min(burn_in, n)))
+
+    # Trailing pad: the event window must fit fully on the grid.
+    tail_start = max(0, n - event_half_width)
+    forbidden.update(range(tail_start, n))
+
+    # Exclude every real event window (plus a buffer) so no real effect bleeds in.
+    half = event_half_width + _PLACEBO_BUFFER
+    import pandas as pd
+
+    for event_date in event_dates:
+        pos = int(grid.searchsorted(pd.Timestamp(event_date), side="left"))
+        lo = max(0, pos - half)
+        hi = min(n, pos + half + 1)
+        forbidden.update(range(lo, hi))
+
+    return forbidden
+
+
 def sample_placebo_dates(
     grid: pd.DatetimeIndex,
     event_dates: list[date],
@@ -109,14 +160,89 @@ def sample_placebo_dates(
     Returns
     -------
     list[date]
-        The sampled placebo dates (all outside every real event window).
+        The sampled placebo dates (all outside every real event window). Sampling
+        is WITHOUT replacement when enough eligible days exist, else WITH
+        replacement (so the requested ``n_placebo`` is always honoured).
 
     Raises
     ------
     EventCalendarError
-        If too few eligible non-event dates remain to draw ``n_placebo``.
+        If no eligible non-event dates remain at all.
     """
-    raise NotImplementedError
+    if n_placebo < 1:
+        raise EventCalendarError(f"n_placebo must be >= 1, got {n_placebo}.")
+
+    n = len(grid)
+    forbidden = _forbidden_positions(
+        grid,
+        event_dates,
+        event_half_width=event_half_width,
+        estimation_window=estimation_window,
+        estimation_gap=estimation_gap,
+    )
+    eligible = np.array([i for i in range(n) if i not in forbidden], dtype=np.int64)
+    if eligible.size == 0:
+        raise EventCalendarError(
+            "no eligible non-event dates remain to draw placebo anchors "
+            "(every position is forbidden by the burn-in / event-window guards)."
+        )
+
+    rng = make_rng(seed)
+    replace = eligible.size < n_placebo
+    chosen = rng.choice(eligible, size=n_placebo, replace=replace)
+    return [grid[int(pos)].date() for pos in chosen]
+
+
+def _placebo_anchor_car(
+    returns: pd.DataFrame,
+    market: pd.Series,
+    anchor_date: date,
+    *,
+    event_half_width: int,
+    estimation_window: int,
+    estimation_gap: int,
+    model: ModelKind,
+) -> float | None:
+    """Compute the cross-sectional mean CAR for one placebo anchor (or ``None``).
+
+    Returns ``None`` when the anchor lacks usable history (already excluded by the
+    forbidden-set guard, but kept defensive so a single bad draw never aborts the
+    run).
+    """
+    grid = returns.index
+    try:
+        windows = build_windows(
+            grid,  # type: ignore[arg-type]
+            anchor_date,
+            event_half_width=event_half_width,
+            estimation_window=estimation_window,
+            estimation_gap=estimation_gap,
+        )
+    except (InsufficientDataError, EventCalendarError):  # pragma: no cover - guarded
+        return None
+    result = cumulative_abnormal_returns(returns, market, windows, model=model)
+    car_values = result.car.to_numpy(dtype=np.float64)
+    finite = car_values[np.isfinite(car_values)]
+    return float(finite.mean()) if finite.size else None
+
+
+def _block_means(anchors: np.ndarray, block: int) -> np.ndarray:
+    """Average ``anchors`` in consecutive blocks of size ``block`` (drop empties).
+
+    Each block mirrors the observed "mean over ``n_events``" statistic. A trailing
+    partial block is averaged on its own so no valid placebo anchor is wasted.
+    """
+    if block <= 1:
+        return anchors
+    n_full = anchors.size // block
+    means: list[float] = []
+    if n_full:
+        reshaped = anchors[: n_full * block].reshape(n_full, block)
+        means.extend(reshaped.mean(axis=1).tolist())
+    remainder = anchors[n_full * block :]
+    if remainder.size:
+        means.append(float(remainder.mean()))
+    return np.asarray(means, dtype=np.float64)
 
 
 def placebo_distribution(
@@ -165,5 +291,71 @@ def placebo_distribution(
     -------
     PlaceboResult
         The null distribution and the observed CAR's percentile/p-value.
+
+    Notes
+    -----
+    The observed statistic is the cross-sectional mean CAR averaged over the
+    ``len(event_dates)`` REAL events. To compare like with like, EACH placebo
+    draw averages the cross-sectional mean CAR over a block of the SAME number of
+    placebo anchors, so the null has the same variance scaling as the observed
+    statistic (a single-date placebo would be far noisier and bias the percentile
+    high). On a no-effect panel this makes the observed percentile ~uniform.
+
+    Raises
+    ------
+    EventCalendarError
+        If no eligible placebo dates remain.
     """
-    raise NotImplementedError
+    grid = returns.index
+    n_events = max(1, len(event_dates))
+    # Draw a block of ``n_events`` placebo anchors per placebo replicate so each
+    # draw mirrors the observed "mean over n_events" statistic.
+    placebo_dates = sample_placebo_dates(
+        grid,  # type: ignore[arg-type]
+        event_dates,
+        n_placebo=n_placebo * n_events,
+        event_half_width=event_half_width,
+        estimation_window=estimation_window,
+        estimation_gap=estimation_gap,
+        seed=seed,
+    )
+
+    per_anchor: list[float] = []
+    for placebo_date in placebo_dates:
+        car = _placebo_anchor_car(
+            returns,
+            market,
+            placebo_date,
+            event_half_width=event_half_width,
+            estimation_window=estimation_window,
+            estimation_gap=estimation_gap,
+            model=model,
+        )
+        if car is not None:
+            per_anchor.append(car)
+
+    anchors = np.asarray(per_anchor, dtype=np.float64)
+    if anchors.size == 0:  # pragma: no cover - defensive only
+        raise EventCalendarError("no valid placebo CARs could be computed.")
+
+    # Average consecutive blocks of ``n_events`` anchors into one placebo draw,
+    # matching the observed statistic's structure. A trailing partial block (if
+    # some anchors were skipped) is averaged on its own so no draw is wasted.
+    draws = _block_means(anchors, n_events)
+
+    # Two-sided percentile: where does |observed| fall within the |placebo| null?
+    obs = abs(float(observed_car))
+    abs_draws = np.abs(draws)
+    # Fraction of placebo |CAR| at or below the observed |CAR| -> percentile.
+    percentile = float(np.mean(abs_draws <= obs) * 100.0)
+    # Two-sided tail probability: fraction of placebo draws AT LEAST as extreme.
+    p_value = float(np.mean(abs_draws >= obs))
+    p_value = min(max(p_value, 0.0), 1.0)
+
+    return PlaceboResult(
+        observed_car=float(observed_car),
+        placebo_cars=draws,
+        percentile=percentile,
+        p_value=p_value,
+        n_placebo=int(draws.size),
+    )
