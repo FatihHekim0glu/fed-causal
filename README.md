@@ -76,29 +76,126 @@ Torch-free and lean: there is no `[all]` extra and no `torch`/`onnx`/`sklearn`.
 
 ## Validation
 
-> _Filled in once the compute kernels land (this is the scaffold commit)._
+### Deployed-default result (the honest null)
 
-| Check | What it asserts | Status |
+These are the metrics the hosted tool serves by default — the seeded synthetic
+event panel scored with `event_window=1` (`[-1, +1]`), `estimation_window=120`,
+`model="market"`, `surprise="all"`, `n_placebo=500`, `seed=7`. They are committed
+in [`src/fedcausal/artifacts/reference.json`](src/fedcausal/artifacts/reference.json)
+and held in lock-step with the live `run_analysis` output by a regression test.
+
+| Metric | Value | Reads as |
+| --- | ---: | --- |
+| Mean CAR | **+0.4766%** (`0.004766`) | A transient average move around the announcement. |
+| CAR _t_-stat | **5.53** | Large in isolation — but a raw _t_-stat is **not** the verdict. |
+| HAC _p_-value (Newey-West) | **6.4e-14** | The mean CAR survives a HAC-robust standard error. |
+| Placebo percentile | **100.0** (placebo _p_ = 0.00) | The observed CAR sits at the top of the placebo-date null. |
+| DiD coefficient | **+0.9732%** (`0.009732`) | Rate-sensitive ("treated") names move more — real heterogeneity. |
+| DiD _p_-value / net-of-cost spread | **0.078** / **+0.0037** | The long/short spread is **not** significant net of costs. |
+| `n_tests` (spec grid) | **2** | Honest multiple-testing denominator. |
+| **`fed_effect_is_tradable`** | **`false`** | Three legs clear; the **net-of-cost tradable DiD spread fails**, so the pure verdict is `false`. |
+
+The takeaway is the deliverable: even when the CAR is significant against the
+placebo null **and** HAC-robust, the move is **cross-sectional heterogeneity**
+(rate-sensitive names move more, mechanically), **not** a long/short alpha that
+survives transaction costs. The verdict is a pure function — it is **not narrated
+down to `false`**, it is *derived* `false`.
+
+The pure-noise control panel fails every leg (placebo _p_ = 0.28, HAC _p_ = 0.16,
+DiD spread negative) and is likewise `fed_effect_is_tradable = false`, confirming
+the machinery does not manufacture an effect where none was injected.
+
+### Correctness gates
+
+Every gate below is an executed test (`tests/{parity,property,regression,integration}`),
+not a claim. Run them with `uv run pytest`.
+
+| Gate | What it asserts | Test |
 | --- | --- | --- |
-| Known-CAR recovery | Injected CAR recovered within tolerance on the synthetic panel | _pending_ |
-| Honest-null guard | Pure-noise panel → `fed_effect_is_tradable = False` after placebo + multiple testing | _pending_ |
-| Placebo uniformity | Observed-CAR percentile ~uniform on a no-effect panel | _pending_ |
-| Estimation/event no-overlap | Windows never overlap or straddle (property test) | _pending_ |
-| Beta invariance | Perturbing event-window returns leaves fitted betas byte-identical | _pending_ |
-| HAC parity | Newey-West SE matches the reference to 1e-10 | _pending_ |
-| BMP / BH / Romano-Wolf parity | Statistics match hand/reference values | _pending_ |
+| Market-model vs statsmodels | Estimation-window-only market-model abnormal returns match a statsmodels OLS reference | `parity/test_parity_eventstudy.py::test_market_model_abnormal_returns_vs_statsmodels_ols` |
+| HAC parity (1e-10) | Newey-West HAC standard error matches the reused `evaluation/hac.py` reference to `1e-10` | `parity/test_parity_eventstudy.py::test_hac_se_matches_reference_to_1e_10` |
+| BMP statistic | Boehmer-Musumeci-Poulsen standardized-residual statistic matches a hand reference | `parity/test_parity_eventstudy.py::test_bmp_statistic_vs_hand_reference` |
+| BH FWER | Benjamini-Hochberg adjusted _p_-values match statsmodels and are monotone | `parity/test_parity_multiple_testing.py::test_benjamini_hochberg_matches_statsmodels` |
+| Romano-Wolf FWER | Romano-Wolf stepdown matches a hand reference and controls FWER on the global null | `parity/test_parity_multiple_testing.py::test_romano_wolf_controls_fwer_on_global_null` |
+| DiD vs statsmodels | DiD point estimate and clustered SE match statsmodels OLS / cluster-robust covariance | `parity/test_parity_did.py::test_did_clustered_se_matches_statsmodels_cluster` |
+| Estimation/event no-overlap | The estimation and event windows never overlap or straddle (property) | `property/test_events_windows.py::test_estimation_and_event_windows_never_overlap` |
+| Placebo excludes events | Placebo dates exclude every real event window — no contamination (property) | `property/test_eventstudy_invariants.py::test_placebo_dates_exclude_every_real_event_window` |
+| Beta invariance | Perturbing event-window returns leaves the fitted market-model betas byte-identical (property) | `property/test_eventstudy_invariants.py::test_market_model_beta_invariant_to_event_window_perturbation` |
+| Known-CAR recovery | The injected CAR is recovered within tolerance on rate-sensitive names (`0.0098` vs injected `0.01`) | `regression/test_regression_honest_null.py::test_known_car_recovered_within_tolerance` |
+| Pure-noise honest-null | A pure-noise panel yields `fed_effect_is_tradable = False` after placebo + multiple testing, deterministically across `PYTHONHASHSEED` | `regression/test_regression_honest_null.py::test_pure_noise_panel_is_not_tradable` |
+
+## Reproduce
+
+Lean install (no `torch`/`onnx`/`sklearn`), then run the CLI and the gates:
+
+```bash
+# 1. Lean environment
+uv venv
+uv pip install -e ".[data,viz,cli,dev]"
+
+# 2. CLI (all default to the seeded synthetic panel — no network)
+uv run fedcausal eventstudy --event-window 1 --estimation-window 120 --model market
+uv run fedcausal placebo    --n-placebo 500 --seed 7
+uv run fedcausal did        --event-window 1 --estimation-window 120
+
+# 3. Regenerate the committed deployed-default reference (drift-guarded in CI)
+uv run python scripts/build_reference.py        # writes src/fedcausal/artifacts/reference.json
+uv run python scripts/build_reference.py --check # CI drift guard (no write)
+
+# 4. Quality gates (all green: ruff, strict mypy, pytest-cov >= 85%)
+uv run ruff check .
+uv run mypy src/fedcausal
+uv run pytest --cov=fedcausal --cov-report=term-missing
+```
+
+The synthetic default is fully offline. The optional real-data path
+(`--data-source-pref fred+polygon`) lazily fetches the keyless FRED rate series
+and the Polygon PIT cross-section, degrading to the synthetic/committed panel on
+any failure — it never hard-fails.
 
 ## Limitations
 
-- **Event-study confounding:** other macro releases can cluster near FOMC dates;
-  abnormal returns attribute the move to the announcement window, not to a clean
-  exogenous shock.
-- **FOMC surprise proxy:** the surprise sign is the realized target-rate change,
-  a coarse proxy for the *unexpected* component (no fed-funds-futures surprise).
-- **PIT survivorship:** the Polygon point-in-time universe approximates index
-  membership and cannot perfectly reconstruct historical constituents.
-- **Synthetic default:** the deployed default is a seeded synthetic panel; it
-  validates the machinery against ground truth but is not real market data.
+These are first-order threats to the causal interpretation, not footnotes. They
+are why the verdict is conservative by construction.
+
+- **Event-study confounding (identification, not just noise).** An event study
+  measures association in a window, not a clean exogenous shock. Other macro
+  releases (CPI, NFP, Treasury auctions) cluster near FOMC dates, and the
+  announcement itself bundles the rate decision with the statement, the dot plot,
+  and the press conference. CAR attributes the entire windowed move to "the
+  announcement"; it cannot isolate the marginal causal effect of the rate
+  decision alone. A significant CAR is consistent with, but does not prove, a
+  causal Fed effect.
+- **FOMC surprise proxy is coarse.** The surprise sign is the realized
+  target-rate change observable at the announcement, not the *unexpected*
+  component. Markets price expectations, so the policy-relevant shock is the
+  surprise relative to fed-funds-futures (or OIS) — which this tool does **not**
+  use. Many "hawkish" meetings were fully anticipated and should carry near-zero
+  surprise; classifying by realized sign mislabels them and attenuates / mislabels
+  the heterogeneity contrast.
+- **PIT survivorship is approximate.** The Polygon point-in-time universe
+  approximates index membership as-of the event but cannot perfectly reconstruct
+  historical constituents (additions, deletions, ticker changes, M&A). Residual
+  survivorship bias tilts the cross-section toward names that *stayed* in the
+  index, which would, if anything, inflate an apparent effect — so the honest
+  null is the conservative reading.
+- **Synthetic default is a machinery test, not market evidence.** The deployed
+  default and every committed metric come from a seeded synthetic panel with a
+  *known* injected CAR and rate-sensitivity heterogeneity. This validates that the
+  placebo/HAC/DiD/multiple-testing stack recovers ground truth and refuses to
+  manufacture an effect — it is **not** a claim about live markets. Real-data runs
+  require the keyless-FRED + Polygon-PIT path and inherit all of the above.
+
+## Design & decisions
+
+- [`docs/DESIGN.md`](docs/DESIGN.md) — the pipeline, leakage guards, and why the
+  verdict is a pure function.
+- [`docs/decisions/`](docs/decisions/) — architecture decision records:
+  [estimation-window-only market model](docs/decisions/0001-estimation-window-only-market-model.md),
+  [placebo as primary significance](docs/decisions/0002-placebo-as-primary-significance.md),
+  [multiple-testing correction](docs/decisions/0003-multiple-testing-correction.md),
+  [honest heterogeneity, not alpha](docs/decisions/0004-honest-heterogeneity-not-alpha.md),
+  [point-in-time universe](docs/decisions/0005-pit-universe.md).
 
 ## References
 

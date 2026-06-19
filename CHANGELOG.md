@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Documentation: replaced the README Validation placeholder with the actual
+  deployed-default metrics from `src/fedcausal/artifacts/reference.json` (mean CAR,
+  CAR _t_-stat, HAC _p_-value, placebo percentile, DiD coefficient,
+  `fed_effect_is_tradable = false`), added a correctness-gates table mapping each
+  gate to its executed test, a Reproduce block (lean install + CLI + ruff/mypy/pytest
+  gates), tightened Limitations (event-study confounding, FOMC surprise proxy, PIT
+  survivorship, synthetic default), and added `docs/DESIGN.md` plus five ADRs under
+  `docs/decisions/` (estimation-window-only market model, placebo as primary
+  significance, multiple-testing correction, honest-heterogeneity-not-alpha, PIT
+  universe).
 - Implemented `serve.run_analysis` — the single hosted entrypoint that wires every
   module group into one leakage-free pipeline (load panel → estimation-window-only
   abnormal returns + CAR → cross-sectional t / BMP / HAC → placebo-date null →
