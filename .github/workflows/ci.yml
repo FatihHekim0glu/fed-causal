@@ -48,3 +48,8 @@ jobs:
 
       - name: Test (pytest + coverage gate)
         run: uv run --no-project pytest -q --cov=fedcausal --cov-report=term --cov-fail-under=85
+
+      - name: Committed reference is up to date
+        # The deployed-default reference.json must match a fresh, seed-locked
+        # rebuild so the backend always serves a reproducible result.
+        run: uv run --no-project python scripts/build_reference.py --check

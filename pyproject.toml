@@ -85,6 +85,13 @@ fedcausal = "fedcausal.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fedcausal"]
+# Ship the committed artifacts (py.typed marker + the precomputed deployed-
+# default reference the backend serves) inside the wheel.
+artifacts = [
+    "src/fedcausal/py.typed",
+    "src/fedcausal/artifacts/reference.json",
+]
+force-include = { "src/fedcausal/artifacts/reference.json" = "fedcausal/artifacts/reference.json" }
 
 [tool.hatch.build.targets.sdist]
 include = [

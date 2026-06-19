@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Implemented `serve.run_analysis` — the single hosted entrypoint that wires every
+  module group into one leakage-free pipeline (load panel → estimation-window-only
+  abnormal returns + CAR → cross-sectional t / BMP / HAC → placebo-date null →
+  rate-sensitivity DiD + net-of-cost spread → Benjamini-Hochberg correction → the
+  PURE `fed_effect_is_tradable` verdict), returning a JSON-serializable summary
+  (all scalars via `_safe_float`), a CAR-path figure with a confidence band, a
+  placebo null-distribution figure, and a `RunManifest`. No network on the default
+  path; the `fred+polygon` preference degrades to synthetic offline.
+- A genuine `surprise` subset filter so the event-study/placebo battery narrows to
+  the requested surprise sign (the DiD always contrasts hawkish vs. dovish).
+- Committed deployed-default reference (`src/fedcausal/artifacts/reference.json`)
+  with a `load_reference()` loader and a reproducible `scripts/build_reference.py`
+  generator (`--check` drift guard, wired into CI). The artifact holds the
+  deployed-default summary, the known-CAR-recovery numbers, and the pure-noise
+  honest-null numbers.
+- Integration tests (end-to-end synthetic → windows → abnormal/CAR → placebo + HAC
+  + DiD → verdict, no network; figures are `{data, layout}` dicts), the honest-null
+  regression (`pure_noise → fed_effect_is_tradable=False`, deterministic across
+  `PYTHONHASHSEED`), the known-CAR recovery regression, a reference-artifact parity
+  regression, and unit coverage for the `serve` validation/surprise-filter helpers.
+- Packaged `reference.json` + `py.typed` into the wheel.
+
 ## [0.1.0] - 2026-06-19
 
 ### Added
