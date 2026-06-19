@@ -30,6 +30,7 @@ from typing import Any
 
 from fedcausal._constants import DEFAULT_ALPHA
 from fedcausal._exceptions import ValidationError
+from fedcausal._validation import validate_alpha
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +134,29 @@ def fed_effect_is_tradable(
     ValidationError
         If any p-value is outside ``[0, 1]`` or ``alpha`` is out of range.
     """
-    raise NotImplementedError
+    return derive_verdict(inputs, alpha=alpha).fed_effect_is_tradable
+
+
+def _evaluate_conditions(
+    inputs: VerdictInputs,
+    *,
+    alpha: float,
+) -> tuple[bool, bool, bool, bool]:
+    """Evaluate the four independent verdict conditions (PURE).
+
+    Returns ``(placebo_significant, hac_robust, survives_multiple_testing,
+    tradable_did_spread)``. Both p-value gates are strict ``< alpha``; the DiD
+    spread is tradable only when it is BOTH positive in the mean AND significant.
+    """
+    placebo_significant = _validate_pvalue(inputs.placebo_pvalue, name="placebo_pvalue") < alpha
+    hac_robust = _validate_pvalue(inputs.hac_pvalue, name="hac_pvalue") < alpha
+    survives_multiple_testing = bool(inputs.multiple_testing_survives)
+    spread_pvalue = _validate_pvalue(inputs.did_spread_pvalue, name="did_spread_pvalue")
+    net_spread = float(inputs.did_net_spread)
+    if not math.isfinite(net_spread):
+        raise ValidationError(f"did_net_spread must be finite, got {inputs.did_net_spread}.")
+    tradable_did_spread = net_spread > 0.0 and spread_pvalue < alpha
+    return placebo_significant, hac_robust, survives_multiple_testing, tradable_did_spread
 
 
 def derive_verdict(
@@ -143,9 +166,10 @@ def derive_verdict(
 ) -> FedVerdict:
     """Derive the full verdict (boolean + per-condition evidence + rationale).
 
-    Wraps :func:`fed_effect_is_tradable`, exposing each of the four conditions
-    individually and an honest one-line rationale, so the API/frontend can render
-    the "Tradable Fed effect: NO" badge with its supporting evidence.
+    The PURE core: it evaluates each of the four conditions individually, ANDs
+    them into the headline boolean (which :func:`fed_effect_is_tradable` simply
+    reads off), and attaches an honest one-line rationale so the API/frontend can
+    render the "Tradable Fed effect: NO" badge with its supporting evidence.
 
     Parameters
     ----------
@@ -164,7 +188,65 @@ def derive_verdict(
     ValidationError
         If any p-value is outside ``[0, 1]`` or ``alpha`` is out of range.
     """
-    raise NotImplementedError
+    alpha = validate_alpha(alpha)
+    placebo_significant, hac_robust, survives_multiple_testing, tradable_did_spread = (
+        _evaluate_conditions(inputs, alpha=alpha)
+    )
+    is_tradable = (
+        placebo_significant and hac_robust and survives_multiple_testing and tradable_did_spread
+    )
+    rationale = _rationale(
+        is_tradable=is_tradable,
+        placebo_significant=placebo_significant,
+        hac_robust=hac_robust,
+        survives_multiple_testing=survives_multiple_testing,
+        tradable_did_spread=tradable_did_spread,
+    )
+    return FedVerdict(
+        fed_effect_is_tradable=is_tradable,
+        placebo_significant=placebo_significant,
+        hac_robust=hac_robust,
+        survives_multiple_testing=survives_multiple_testing,
+        tradable_did_spread=tradable_did_spread,
+        rationale=rationale,
+    )
+
+
+#: The four condition flags in verdict order, paired with the honest label naming
+#: the line of evidence that fails when the flag is ``False``.
+_CONDITION_LABELS: tuple[tuple[str, str], ...] = (
+    ("placebo_significant", "placebo-percentile significance"),
+    ("hac_robust", "HAC-robust mean CAR"),
+    ("survives_multiple_testing", "multiple-testing survival across the full grid"),
+    ("tradable_did_spread", "a net-of-cost tradable DiD spread"),
+)
+
+
+def _rationale(
+    *,
+    is_tradable: bool,
+    placebo_significant: bool,
+    hac_robust: bool,
+    survives_multiple_testing: bool,
+    tradable_did_spread: bool,
+) -> str:
+    """Return a short, honest sentence explaining the derived verdict."""
+    if is_tradable:
+        return (
+            "Tradable: the CAR is placebo-significant, HAC-robust, survives "
+            "multiple testing, and the DiD spread clears costs."
+        )
+    flags = {
+        "placebo_significant": placebo_significant,
+        "hac_robust": hac_robust,
+        "survives_multiple_testing": survives_multiple_testing,
+        "tradable_did_spread": tradable_did_spread,
+    }
+    failed = [label for key, label in _CONDITION_LABELS if not flags[key]]
+    return (
+        "Not tradable: the FOMC move is cross-sectional heterogeneity, not a "
+        f"placebo-robust tradable alpha — failing {', '.join(failed)}."
+    )
 
 
 def _validate_pvalue(value: float, *, name: str) -> float:
