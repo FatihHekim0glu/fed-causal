@@ -21,12 +21,27 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import TYPE_CHECKING, Any
 
-from fedcausal._constants import DEFAULT_ESTIMATION_WINDOW
+import numpy as np
+import pandas as pd
+
+from fedcausal._constants import (
+    DEFAULT_ESTIMATION_GAP,
+    DEFAULT_ESTIMATION_WINDOW,
+    MAX_EVENT_HALF_WIDTH,
+)
+from fedcausal._exceptions import ValidationError
+from fedcausal._rng import make_rng
 
 if TYPE_CHECKING:
-    import pandas as pd
-
     from fedcausal._typing import SurpriseLabel
+
+#: Fixed reference start date for the synthetic panel (deterministic by default).
+_DEFAULT_START: date = date(2015, 1, 1)
+
+#: Sign-dependent move (per rate-sensitive name, spread over the event window)
+#: added on hawkish/dovish events to create cross-sectional DiD heterogeneity.
+#: Scaled by ``injected_car`` so a richer effect amplifies the treated/control gap.
+_SURPRISE_TILT_FRAC: float = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +90,49 @@ class SyntheticPanel:
             "seed": int(self.seed),
             "meta": dict(self.meta),
         }
+
+
+def _classify_sign(rate_change: float) -> SurpriseLabel:
+    """Map a signed synthetic rate change to a surprise label (no leakage)."""
+    if rate_change > 0:
+        return "hawkish"
+    if rate_change < 0:
+        return "dovish"
+    return "neutral"
+
+
+def _validate_params(
+    *,
+    n_names: int,
+    n_events: int,
+    spacing: int,
+    estimation_window: int,
+    event_half_width: int,
+    rate_sensitive_frac: float,
+    noise_scale: float,
+) -> None:
+    """Validate generator sizing parameters, raising :class:`ValidationError`."""
+    if n_names < 2:
+        raise ValidationError(f"n_names must be >= 2, got {n_names}.")
+    if n_events < 1:
+        raise ValidationError(f"n_events must be >= 1, got {n_events}.")
+    if event_half_width < 1 or event_half_width > MAX_EVENT_HALF_WIDTH:
+        raise ValidationError(
+            f"event_half_width must be in [1, {MAX_EVENT_HALF_WIDTH}], got {event_half_width}."
+        )
+    if estimation_window < 2:
+        raise ValidationError(f"estimation_window must be >= 2, got {estimation_window}.")
+    # Spacing must exceed the full event window so adjacent windows never straddle.
+    if spacing <= 2 * event_half_width:
+        raise ValidationError(
+            f"spacing ({spacing}) must exceed 2*event_half_width ({2 * event_half_width})."
+        )
+    if not 0.0 < rate_sensitive_frac < 1.0:
+        raise ValidationError(
+            f"rate_sensitive_frac must lie strictly in (0, 1), got {rate_sensitive_frac}."
+        )
+    if noise_scale <= 0.0 or not np.isfinite(noise_scale):
+        raise ValidationError(f"noise_scale must be a positive finite float, got {noise_scale}.")
 
 
 def synthetic_event_panel(
@@ -134,7 +192,98 @@ def synthetic_event_panel(
     ValidationError
         If any size parameter is out of range.
     """
-    raise NotImplementedError
+    _validate_params(
+        n_names=n_names,
+        n_events=n_events,
+        spacing=spacing,
+        estimation_window=estimation_window,
+        event_half_width=event_half_width,
+        rate_sensitive_frac=rate_sensitive_frac,
+        noise_scale=noise_scale,
+    )
+
+    rng = make_rng(seed)
+    k = event_half_width
+
+    # ---- trading-day grid -------------------------------------------------- #
+    # Leading burn-in must cover the estimation window + the estimation gap + the
+    # event half-width so the FIRST event has a complete, non-overlapping
+    # pre-event estimation window. A trailing pad covers the last event window.
+    burn_in = estimation_window + DEFAULT_ESTIMATION_GAP + k
+    first_event_pos = burn_in
+    last_event_pos = first_event_pos + (n_events - 1) * spacing
+    n_obs = last_event_pos + k + 1
+    start_date = start if start is not None else _DEFAULT_START
+    grid = pd.date_range(start=start_date, periods=n_obs, freq="B")
+
+    event_positions = [first_event_pos + i * spacing for i in range(n_events)]
+    announcement_dates = [grid[pos].date() for pos in event_positions]
+
+    # ---- names & rate-sensitivity ----------------------------------------- #
+    tickers = [f"N{i:03d}" for i in range(n_names)]
+    n_rate_sensitive = max(1, min(n_names - 1, round(n_names * rate_sensitive_frac)))
+    rate_sensitive = tickers[:n_rate_sensitive]
+    rate_sensitive_mask = np.zeros(n_names, dtype=bool)
+    rate_sensitive_mask[:n_rate_sensitive] = True
+
+    # ---- one-factor market model ------------------------------------------ #
+    # Market factor: zero-mean daily returns. Per-name alpha/beta are stable.
+    market = rng.normal(0.0, 0.008, size=n_obs)
+    alpha = rng.uniform(-0.0002, 0.0002, size=n_names)
+    beta = rng.uniform(0.6, 1.4, size=n_names)
+    eps = rng.normal(0.0, noise_scale, size=(n_obs, n_names))
+
+    # Base returns: r_it = alpha_i + beta_i * market_t + eps_it (NO event effect).
+    base = alpha[None, :] + np.outer(market, beta) + eps
+    returns = base.copy()
+
+    # ---- inject the KNOWN CAR + sign-dependent DiD heterogeneity ----------- #
+    # Spread the injected CAR evenly across the (2k + 1) event-window days of the
+    # rate-sensitive names so the summed abnormal return over the window recovers
+    # ``injected_car``. Hawkish/dovish events add a sign-dependent tilt (also
+    # spread over the window) to give the treated-vs-control DiD a signal.
+    window_len = 2 * k + 1
+    per_day_car = injected_car / window_len
+    tilt = _SURPRISE_TILT_FRAC * abs(injected_car)
+    per_day_tilt = tilt / window_len
+
+    surprises: list[SurpriseLabel] = []
+    # Deterministic surprise pattern: cycle hawkish / dovish / neutral so all
+    # three signs are present regardless of n_events (>=3 gives all three).
+    sign_cycle = (1.0, -1.0, 0.0)
+    for i, pos in enumerate(event_positions):
+        rate_change = sign_cycle[i % len(sign_cycle)]
+        surprises.append(_classify_sign(rate_change))
+        lo = pos - k
+        hi = pos + k  # inclusive
+        # Known CAR into rate-sensitive names (the recovery target).
+        returns[lo : hi + 1, rate_sensitive_mask] += per_day_car
+        # Sign-dependent tilt into rate-sensitive names only (DiD heterogeneity:
+        # treated names move with the surprise sign; controls do not).
+        if rate_change != 0.0:
+            returns[lo : hi + 1, rate_sensitive_mask] += rate_change * per_day_tilt
+
+    returns_df = pd.DataFrame(returns, index=grid, columns=tickers).astype("float64")
+    market_series = pd.Series(market, index=grid, name="market", dtype="float64")
+
+    meta: dict[str, Any] = {
+        "n_obs": int(n_obs),
+        "spacing": int(spacing),
+        "event_half_width": int(k),
+        "estimation_window": int(estimation_window),
+        "noise_scale": float(noise_scale),
+        "rate_sensitive_frac": float(rate_sensitive_frac),
+    }
+    return SyntheticPanel(
+        returns=returns_df,
+        market=market_series,
+        announcement_dates=announcement_dates,
+        surprises=surprises,
+        rate_sensitive=rate_sensitive,
+        injected_car=float(injected_car),
+        seed=int(seed),
+        meta=meta,
+    )
 
 
 def rate_sensitive_panel(
@@ -164,7 +313,7 @@ def rate_sensitive_panel(
     SyntheticPanel
         The rate-sensitive panel with ground-truth metadata.
     """
-    raise NotImplementedError
+    return synthetic_event_panel(seed=seed, injected_car=injected_car, **kwargs)
 
 
 def pure_noise_panel(
@@ -193,4 +342,5 @@ def pure_noise_panel(
     SyntheticPanel
         The pure-noise panel (``injected_car == 0.0``).
     """
-    raise NotImplementedError
+    kwargs.pop("injected_car", None)
+    return synthetic_event_panel(seed=seed, injected_car=0.0, **kwargs)
