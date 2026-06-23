@@ -214,7 +214,7 @@ def run_pipeline(
     """
     import numpy as np
 
-    from fedcausal._constants import DEFAULT_ALPHA, DEFAULT_ESTIMATION_GAP
+    from fedcausal._constants import DEFAULT_ALPHA, DEFAULT_COST_BPS, DEFAULT_ESTIMATION_GAP
     from fedcausal.data.loaders import load_event_panel
     from fedcausal.did.heterogeneity import heterogeneity_spread
     from fedcausal.did.model import build_did_panel, estimate_did
@@ -274,7 +274,11 @@ def run_pipeline(
     did_panel = build_did_panel(abnormal_by_event, kept_surprises, panel.rate_sensitive)
     did = estimate_did(did_panel, cluster="event", alpha=DEFAULT_ALPHA)
     spread_samples = _did_spread_samples(abnormal_by_event, kept_surprises, panel.rate_sensitive)
-    spread = heterogeneity_spread(did, spread_samples, alpha=DEFAULT_ALPHA)
+    # Mirror serve.py exactly: same net-of-cost spread inputs (cost_bps + alpha) so
+    # both entrypoints feed condition 4 the identical net-of-cost p-value source.
+    spread = heterogeneity_spread(
+        did, spread_samples, cost_bps=DEFAULT_COST_BPS, alpha=DEFAULT_ALPHA
+    )
 
     # ---- multiple-testing correction over the model spec grid ------------- #
     grid_pvalues = _spec_grid_pvalues(panel.returns, panel.market, windows_list)
@@ -287,7 +291,12 @@ def run_pipeline(
             hac_pvalue=tests.hac_pvalue,
             multiple_testing_survives=mt.any_survives,
             did_net_spread=spread.net_spread,
-            did_spread_pvalue=did.p_value if spread.net_spread > 0.0 else 1.0,
+            # Condition 4 must gate on the NET-of-cost spread significance (which
+            # already prices in transaction costs), NOT the gross clustered-DiD
+            # interaction p-value. spread.net_pvalue is exactly the p-value behind
+            # spread.is_tradable_spread, identical to the source serve.py feeds the
+            # verdict — so the CLI and the served verdict derive identically.
+            did_spread_pvalue=spread.net_pvalue,
         ),
         alpha=DEFAULT_ALPHA,
     )

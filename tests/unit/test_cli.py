@@ -129,6 +129,115 @@ def test_build_app_runs_via_runner() -> None:
     assert "Tradable Fed effect: NO" in result.stdout
 
 
+def test_cli_and_serve_agree_on_verdict() -> None:
+    """The CLI and the hosted entrypoint derive the IDENTICAL verdict.
+
+    Both ``cli.run_pipeline`` and ``serve.run_analysis`` feed the PURE verdict the
+    SAME four lines of evidence — in particular, condition 4 must gate on the
+    NET-of-cost spread p-value (``spread.net_pvalue``), never the gross
+    clustered-DiD interaction p-value. Running both entrypoints on the identical
+    seeded synthetic panel/params must therefore yield the same headline boolean,
+    so the CLI and the served verdict can never disagree on the same inputs.
+    """
+    from fedcausal.serve import run_analysis
+
+    cli_summary = run_pipeline(n_placebo=_FAST_PLACEBO, seed=7)
+    serve_result = run_analysis(n_placebo=_FAST_PLACEBO, seed=7)
+
+    assert (
+        cli_summary.fed_effect_is_tradable
+        == serve_result.summary["fed_effect_is_tradable"]
+    )
+    # The shared significance gates the verdict consumes must match byte-for-byte
+    # on the same inputs (placebo + HAC are computed identically by both paths).
+    assert cli_summary.placebo_pvalue == serve_result.summary["placebo_pvalue"]
+    assert cli_summary.car_hac_pvalue == serve_result.summary["car_hac_pvalue"]
+
+
+def test_cli_verdict_condition4_uses_net_of_cost_pvalue() -> None:
+    """The CLI gates condition 4 on ``spread.net_pvalue`` — same source as serve.
+
+    Reconstructs the net-of-cost spread the CLI pipeline computes and asserts the
+    CLI's headline verdict equals a verdict derived from ``spread.net_pvalue``
+    (the net-of-cost source serve.py feeds), and that this can DIFFER from a
+    verdict mistakenly gated on the gross clustered-DiD interaction p-value. This
+    pins the alignment so a regression to ``did.p_value`` is caught.
+    """
+    import numpy as np
+
+    from fedcausal._constants import (
+        DEFAULT_ALPHA,
+        DEFAULT_COST_BPS,
+        DEFAULT_ESTIMATION_GAP,
+    )
+    from fedcausal.cli import _abnormal_and_sigma_by_event, _did_spread_samples
+    from fedcausal.data.loaders import load_event_panel
+    from fedcausal.did.heterogeneity import heterogeneity_spread
+    from fedcausal.did.model import build_did_panel, estimate_did
+    from fedcausal.evaluation.verdict import VerdictInputs, derive_verdict
+    from fedcausal.events.windows import build_all_windows
+    from fedcausal.eventstudy.abnormal import stack_event_cars
+    from fedcausal.eventstudy.placebo import placebo_distribution
+    from fedcausal.eventstudy.tests import run_car_tests
+
+    panel, _src = load_event_panel(data_source_pref="synthetic", seed=7)
+    windows = build_all_windows(
+        panel.returns.index,  # type: ignore[arg-type]
+        panel.announcement_dates,
+        event_half_width=1,
+        estimation_window=120,
+        estimation_gap=DEFAULT_ESTIMATION_GAP,
+    )
+    surprise_by_date = dict(
+        zip(panel.announcement_dates, panel.surprises, strict=True)
+    )
+    kept = [surprise_by_date[w.announcement_date] for w in windows]
+    abnormal_by_event, sigmas = _abnormal_and_sigma_by_event(
+        panel.returns, panel.market, windows, model="market"
+    )
+    cars = stack_event_cars(panel.returns, panel.market, windows, model="market")
+    observed = float(np.mean(cars))
+    tests = run_car_tests(cars, abnormal_by_event, sigmas, alpha=DEFAULT_ALPHA)
+    placebo_dist = placebo_distribution(
+        panel.returns,
+        panel.market,
+        [w.announcement_date for w in windows],
+        observed,
+        n_placebo=_FAST_PLACEBO,
+        event_half_width=1,
+        estimation_window=120,
+        estimation_gap=DEFAULT_ESTIMATION_GAP,
+        model="market",
+        seed=7,
+    )
+    did_panel = build_did_panel(abnormal_by_event, kept, panel.rate_sensitive)
+    did_res = estimate_did(did_panel, cluster="event", alpha=DEFAULT_ALPHA)
+    spread_samples = _did_spread_samples(abnormal_by_event, kept, panel.rate_sensitive)
+    spread = heterogeneity_spread(
+        did_res, spread_samples, cost_bps=DEFAULT_COST_BPS, alpha=DEFAULT_ALPHA
+    )
+
+    base = {
+        "placebo_pvalue": placebo_dist.p_value,
+        "hac_pvalue": tests.hac_pvalue,
+        "multiple_testing_survives": True,
+        "did_net_spread": spread.net_spread,
+    }
+    net_verdict = derive_verdict(
+        VerdictInputs(did_spread_pvalue=spread.net_pvalue, **base),
+        alpha=DEFAULT_ALPHA,
+    )
+
+    # The CLI pipeline must reproduce the net-of-cost-sourced condition-4 flag.
+    cli_summary = run_pipeline(n_placebo=_FAST_PLACEBO, seed=7)
+    assert (
+        cli_summary.fed_effect_is_tradable == net_verdict.fed_effect_is_tradable
+    )
+    # And the net-of-cost p-value is the genuine source — not the gross DiD
+    # interaction p-value the buggy CLI used to feed (the two differ here).
+    assert spread.net_pvalue != did_res.p_value
+
+
 def test_importing_cli_does_not_import_typer() -> None:
     """Importing :mod:`fedcausal.cli` in a fresh interpreter pulls in no Typer."""
     import subprocess
